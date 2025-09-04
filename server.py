@@ -14,7 +14,7 @@ if not TOKEN:
     raise SystemExit(1)
 
 # === Telegram Application ===
-application: Application = ApplicationBuilder().token(TOKEN).build()
+application: Application = ApplicationBuilder().token(TOKEN).updater(None).build()
 
 # импортируем регистрацию хэндлеров из твоего кода
 try:
