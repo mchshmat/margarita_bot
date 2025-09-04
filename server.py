@@ -28,6 +28,18 @@ except Exception as e:
 # === FastAPI ===
 app = FastAPI()
 
+# Инициализация PTB при старте FastAPI (обязательно для process_update)
+@app.on_event("startup")
+async def _startup():
+    await application.initialize()
+    print("PTB initialized")
+
+# Корректное завершение PTB при остановке сервера
+@app.on_event("shutdown")
+async def _shutdown():
+    await application.shutdown()
+    print("PTB shutdown")
+
 @app.get("/")
 def root():
     return {"status": "ok"}
