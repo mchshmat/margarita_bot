@@ -1,40 +1,39 @@
+# bot_margarita.py — логика 1-в-1 как в старом боте, но через register_handlers()
 
-import locale
-import sys
-import requests
+import os
 import random
+import requests
+from typing import Tuple, Optional
+
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
     ContextTypes,
+    Application,  # тип для подсказок
     filters,
 )
-import os
 
-# для локального запуска удобно подгружать .env (на сервере Render это не нужно)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+# === ENV ===
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
+DATABASE_ID  = os.environ.get("DATABASE_ID", "").strip()
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]          # из окружения
-DATABASE_ID  = os.environ["DATABASE_ID"]           # из окружения
-BOT_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]    # из окружения
+if not NOTION_TOKEN or not DATABASE_ID:
+    # Не падаем тут, чтобы сервис стартовал; ошибки будут видны в ответах
+    print("WARN: NOTION_TOKEN or DATABASE_ID not set")
 
-# === НАСТРОЙКИ ===
+# === Константы/утилиты ===
+TEXT_INPUT, VIDEO_INPUT = range(2)
 
+def _headers():
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
 
-headers = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json"
-}
-
-def split_text(text, max_length=1800):
+def split_text(text: str, max_length: int = 1800):
     parts = []
     while len(text) > max_length:
         split_pos = text.rfind(" ", 0, max_length)
@@ -45,176 +44,129 @@ def split_text(text, max_length=1800):
     parts.append(text)
     return parts
 
-def get_ready_reels():
+def get_ready_reels() -> Optional[dict]:
+    """Берём случайную страницу со Статусом == 'Готов'."""
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     payload = {
-        "filter": {
-            "property": "Статус",
-            "select": {
-                "equals": "Готов"
-            }
-        }
+        "filter": {"property": "Статус", "select": {"equals": "Готов"}}
     }
-    res = requests.post(url, headers=headers, json=payload)
+    res = requests.post(url, headers=_headers(), json=payload, timeout=30)
     res.raise_for_status()
     data = res.json()
-    if not data["results"]:
+    if not data.get("results"):
         return None
     return random.choice(data["results"])
 
-def extract_reel_info(page):
-    props = page["properties"]
-    video = props["Видео"]["title"][0]["text"]["content"] if props["Видео"]["title"] else ""
-    hook = "".join([part["text"]["content"] for part in props["Хук"]["rich_text"]])
-    desc = "".join([part["text"]["content"] for part in props["Описание"]["rich_text"]])
+def extract_reel_info(page: dict) -> Tuple[str, str, str, str]:
+    """Достаём (video, hook, desc, page_id) из свойств страницы."""
+    props = page.get("properties", {})
+    def _title(prop):
+        arr = props.get(prop, {}).get("title", [])
+        return arr[0]["text"]["content"] if arr else ""
+    def _rt(prop):
+        arr = props.get(prop, {}).get("rich_text", [])
+        return "".join(part.get("text", {}).get("content", "") for part in arr)
+
+    video = _title("Видео")
+    hook  = _rt("Хук")
+    desc  = _rt("Описание")
     return video, hook, desc, page["id"]
 
-def update_status(page_id):
+def update_status(page_id: str):
+    """Меняем Статус на 'Залит'."""
     url = f"https://api.notion.com/v1/pages/{page_id}"
-    payload = {
-        "properties": {
-            "Статус": {
-                "select": {
-                    "name": "Залит"
-                }
-            }
-        }
-    }
-    res = requests.patch(url, headers=headers, json=payload)
+    payload = {"properties": {"Статус": {"select": {"name": "Залит"}}}}
+    res = requests.patch(url, headers=_headers(), json=payload, timeout=30)
     res.raise_for_status()
 
-async def send_reel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    page = get_ready_reels()
-    if not page:
-        await update.message.reply_text("Нет доступных Reels со статусом 'Готов'.")
-        return
-
-    video, hook, desc, page_id = extract_reel_info(page)
-    await update.message.reply_text(hook)
-    await update.message.reply_text(desc)
-    update_status(page_id)
-
-async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
-    payload = {
-        "filter": {
-            "property": "Статус",
-            "select": {
-                "equals": "Готов"
-            }
-        }
-    }
-    res = requests.post(url, headers=headers, json=payload)
-    res.raise_for_status()
-    data = res.json()
-    count = len(data["results"])
-    await update.message.reply_text(f"📊 Сейчас {count} Reels со статусом 'Готов'.")
-
-def add_to_notion(hook, description, video):
+def add_to_notion(hook: str, description: str, video: str):
+    """Добавляем новую запись (Статус = 'Готов')."""
     url = "https://api.notion.com/v1/pages"
     data = {
-        "parent": { "database_id": DATABASE_ID },
+        "parent": {"database_id": DATABASE_ID},
         "properties": {
-            "Видео": {
-                "title": [{
-                    "text": { "content": str(video) }
-                }]
-            },
-            "Хук": {
-                "rich_text": [{"text": {"content": part}} for part in split_text(str(hook))]
-            },
-            "Описание": {
-                "rich_text": [{"text": {"content": part}} for part in split_text(str(description))]
-            },
-            "Статус": {
-                "select": { "name": "Готов" }
-            }
-        }
+            "Видео": {"title": [{"text": {"content": str(video)}}]},
+            "Хук": {"rich_text": [{"text": {"content": part}} for part in split_text(str(hook))]},
+            "Описание": {"rich_text": [{"text": {"content": part}} for part in split_text(str(description))]},
+            "Статус": {"select": {"name": "Готов"}},
+        },
     }
-    response = requests.post(url, headers=headers, json=data)
-    response.raise_for_status()
+    res = requests.post(url, headers=_headers(), json=data, timeout=30)
+    res.raise_for_status()
 
-async def add_combined(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# === HANDLERS (async, PTB v20) ===
+
+async def send_reel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /reel — взять случайную 'Готов' и прислать Хук + Описание, затем пометить 'Залит'."""
     try:
-        message = update.message.text.replace("/add", "", 1).strip()
-        if not message:
-            await update.message.reply_text("Пожалуйста, отправьте хук и описание одним сообщением после /add.")
+        page = get_ready_reels()
+        if not page:
+            await update.message.reply_text("Нет доступных Reels со статусом 'Готов'.")
             return
-        parts = message.split("\n\n", 1)
-        hook = parts[0].strip()
-        description = parts[1].strip() if len(parts) > 1 else ""
-        add_to_notion(hook, description, "-")
-        await update.message.reply_text("✅ Запись добавлена в таблицу.")
+        video, hook, desc, page_id = extract_reel_info(page)
+
+        # последовательные сообщения как раньше
+        if hook:
+            await update.message.reply_text(hook)
+        if desc:
+            # длинные тексты режем на части
+            for part in split_text(desc, 1800):
+                await update.message.reply_text(part)
+
+        update_status(page_id)
     except Exception as e:
-        await update.message.reply_text(f"Ошибка при добавлении: {e}")
+        await update.message.reply_text(f"Ошибка: {e}")
 
-
-from telegram.ext import ConversationHandler
-
-TEXT_INPUT, VIDEO_INPUT = range(2)
+async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /score — количество 'Готов'."""
+    try:
+        url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+        payload = {"filter": {"property": "Статус", "select": {"equals": "Готов"}}}
+        res = requests.post(url, headers=_headers(), json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        count = len(data.get("results", []))
+        await update.message.reply_text(f"📊 Сейчас {count} Reels со статусом 'Готов'.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
 
 async def start_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введи хук и описание в одном сообщении. Первый абзац — хук, остальное — описание.")
+    """Старт диалога /add: пользователь шлёт одним сообщением хук и описание (через пустую строку)."""
+    await update.message.reply_text(
+        "Введи хук и описание в одном сообщении. Первый абзац — хук, остальное — описание."
+    )
     return TEXT_INPUT
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    message = update.message.text.strip()
+    """Принимаем текст от /add (хук + описание), создаём запись (Видео пустое)."""
+    message = (update.message.text or "").strip()
     parts = message.split("\n\n", 1)
     hook = parts[0].strip()
     description = parts[1].strip() if len(parts) > 1 else ""
     try:
         add_to_notion(hook, description, "")
-        # Ответ: два сообщения (хук и рилс)
         await update.message.reply_text("✅ Запись добавлена в таблицу.")
     except Exception as e:
         await update.message.reply_text(f"Ошибка при добавлении: {e}")
     return ConversationHandler.END
 
-async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    video = update.message.text.strip()
-    hook = user_data[uid]["hook"]
-    desc = user_data[uid]["desc"]
-    try:
-        add_to_notion(hook, desc, video)
-        await update.message.reply_text("✅ Запись добавлена в таблицу.")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка при добавлении: {e}")
-    user_data.pop(uid)
-    return ConversationHandler.END
 
+# === РЕГИСТРАЦИЯ ДЛЯ server.py ===
+def register_handlers(application: Application):
+    # Команды
+    application.add_handler(CommandHandler("reel", send_reel))
+    application.add_handler(CommandHandler("score", get_score))
 
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("reel", send_reel))
-    app.add_handler(CommandHandler("score", get_score))
-
-    conv_handler = ConversationHandler(
+    # Диалог /add (одним сообщением)
+    conv = ConversationHandler(
         entry_points=[CommandHandler("add", start_add)],
         states={
             TEXT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
         },
-        fallbacks=[]
+        fallbacks=[],
     )
-    app.add_handler(conv_handler)
-    
-    print("✅ Бот запущен. Пиши /reel или /add.")
-    # --- ВСТАВЬ ЭТО В КОНЕЦ bot_margarita.py ---
+    application.add_handler(conv)
 
-from telegram.ext import CommandHandler, MessageHandler, filters
-
-# Примеры обработчиков (можешь оставить как есть — это проверка, что всё живо)
-async def _start(update, context):
-    await update.message.reply_text("Бот на Render готов. Пиши текст — отвечу эхо.")
-
-async def _echo(update, context):
-    if update.message and update.message.text:
-        await update.message.reply_text(update.message.text)
-
-def register_handlers(application):
-    # Добавь сюда ВСЕ твои обработчики, которые раньше добавлял(а) через add_handler(...)
-    # Минимум — /start и эхо
-    application.add_handler(CommandHandler("start", _start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _echo))
-
+    # ВАЖНО: никаких эхо/общих текстовых хэндлеров тут не добавляем,
+    # чтобы они не перехватывали сообщения и не мешали логике.
