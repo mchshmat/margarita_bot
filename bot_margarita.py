@@ -1,4 +1,4 @@
-# bot_margarita.py — логика 1-в-1 как в старом боте, но через register_handlers()
+# bot_margarita.py — логика 1-в-1 как в старом боте, но без лишних «резов» текста
 
 import os
 import random
@@ -20,11 +20,14 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
 DATABASE_ID  = os.environ.get("DATABASE_ID", "").strip()
 
 if not NOTION_TOKEN or not DATABASE_ID:
-    # Не падаем тут, чтобы сервис стартовал; ошибки будут видны в ответах
     print("WARN: NOTION_TOKEN or DATABASE_ID not set")
 
 # === Константы/утилиты ===
 TEXT_INPUT, VIDEO_INPUT = range(2)
+
+# Жёсткий лимит Телеграма ~4096; оставим запас, чтобы не упираться ровно в 4096
+TELEGRAM_HARD_LIMIT = 4096
+SAFE_LIMIT = 3900
 
 def _headers():
     return {
@@ -33,7 +36,10 @@ def _headers():
         "Content-Type": "application/json",
     }
 
-def split_text(text: str, max_length: int = 1800):
+def split_text(text: str, max_length: int = SAFE_LIMIT):
+    """Режем текст ТОЛЬКО если он реально длиннее лимита.
+    Стараемся резать по пробелу, чтобы не рвать слова.
+    """
     parts = []
     while len(text) > max_length:
         split_pos = text.rfind(" ", 0, max_length)
@@ -41,15 +47,14 @@ def split_text(text: str, max_length: int = 1800):
             split_pos = max_length
         parts.append(text[:split_pos])
         text = text[split_pos:].lstrip()
-    parts.append(text)
+    if text:
+        parts.append(text)
     return parts
 
 def get_ready_reels() -> Optional[dict]:
     """Берём случайную страницу со Статусом == 'Готов'."""
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
-    payload = {
-        "filter": {"property": "Статус", "select": {"equals": "Готов"}}
-    }
+    payload = {"filter": {"property": "Статус", "select": {"equals": "Готов"}}}
     res = requests.post(url, headers=_headers(), json=payload, timeout=30)
     res.raise_for_status()
     data = res.json()
@@ -106,13 +111,17 @@ async def send_reel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         video, hook, desc, page_id = extract_reel_info(page)
 
-        # последовательные сообщения как раньше
+        # 1) Хук — отдельным сообщением, как раньше
         if hook:
             await update.message.reply_text(hook)
+
+        # 2) Описание — одним сообщением, ЕСЛИ влазит; иначе режем по SAFE_LIMIT
         if desc:
-            # длинные тексты режем на части
-            for part in split_text(desc, 1800):
-                await update.message.reply_text(part)
+            if len(desc) <= SAFE_LIMIT:
+                await update.message.reply_text(desc)
+            else:
+                for part in split_text(desc, SAFE_LIMIT):
+                    await update.message.reply_text(part)
 
         update_status(page_id)
     except Exception as e:
@@ -168,5 +177,4 @@ def register_handlers(application: Application):
     )
     application.add_handler(conv)
 
-    # ВАЖНО: никаких эхо/общих текстовых хэндлеров тут не добавляем,
-    # чтобы они не перехватывали сообщения и не мешали логике.
+    # Никаких эхо/общих текстовых хэндлеров — чтобы не перехватывали сообщения.
